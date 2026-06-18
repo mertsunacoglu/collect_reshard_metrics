@@ -1,6 +1,7 @@
 #!/usr/bin/env python3
 import argparse
 import json
+import os
 import subprocess
 import sys
 import time
@@ -9,6 +10,9 @@ from datetime import datetime, timezone
 
 RISK_THRESHOLD_WARN = 80_000    # approaching default dynamic-reshard trigger
 RISK_THRESHOLD_CRIT = 100_000   # at or above default trigger (~102,400 obj/shard)
+
+HEALTH_STATUS_MAP = {"HEALTH_OK": 0, "HEALTH_WARN": 1, "HEALTH_ERR": 2}
+RISK_LEVEL_MAP = {"ok": 0, "warning": 1, "critical": 2}
 
 
 def run_cmd(args, timeout=30):
@@ -171,6 +175,101 @@ def detect_correlations(reshard, cluster):
     return out
 
 
+def format_prometheus(snapshot):
+    lines = []
+    ts_ms = int(datetime.fromisoformat(snapshot["timestamp"]).timestamp() * 1000)
+
+    def metric(name, value, labels=None):
+        label_str = ""
+        if labels:
+            parts = ",".join(f'{k}="{v}"' for k, v in labels.items())
+            label_str = f"{{{parts}}}"
+        lines.append(f"{name}{label_str} {value} {ts_ms}")
+
+    def header(name, help_text, type_="gauge"):
+        lines.append(f"# HELP {name} {help_text}")
+        lines.append(f"# TYPE {name} {type_}")
+
+    q = snapshot["reshard_queue"]
+    header("ceph_rgw_reshard_queue_depth", "Number of buckets pending resharding in the RGW reshard queue")
+    metric("ceph_rgw_reshard_queue_depth", q["queue_depth"])
+
+    c = snapshot["cluster_health"]
+    if "error" not in c:
+        header("ceph_health_status", "Ceph cluster health status: 0=HEALTH_OK 1=HEALTH_WARN 2=HEALTH_ERR")
+        metric("ceph_health_status", HEALTH_STATUS_MAP.get(c["health_status"], -1))
+
+        header("ceph_large_omap_objects", "Number of large OMAP objects reported by cluster health")
+        metric("ceph_large_omap_objects", c["large_omap_objects"])
+
+        osd = c["osd"]
+        header("ceph_osd_total", "Total number of OSDs")
+        metric("ceph_osd_total", osd["num_osds"])
+        header("ceph_osd_up", "Number of OSDs that are up")
+        metric("ceph_osd_up", osd["num_up_osds"])
+        header("ceph_osd_down", "Number of OSDs that are down")
+        metric("ceph_osd_down", osd["num_down_osds"])
+        header("ceph_osd_remapped_pgs", "Number of remapped PGs reported by osdmap")
+        metric("ceph_osd_remapped_pgs", osd["num_remapped_pgs"])
+
+        pgs = c["pgs"]
+        header("ceph_pg_total", "Total number of placement groups")
+        metric("ceph_pg_total", pgs["num_pgs"])
+        header("ceph_pg_degraded", "Number of degraded placement groups")
+        metric("ceph_pg_degraded", pgs["degraded_pgs"])
+        header("ceph_pg_recovering", "Number of recovering placement groups")
+        metric("ceph_pg_recovering", pgs["recovering_pgs"])
+        header("ceph_pg_remapped", "Number of remapped placement groups")
+        metric("ceph_pg_remapped", pgs["remapped_pgs"])
+        header("ceph_pg_degraded_objects", "Number of degraded objects")
+        metric("ceph_pg_degraded_objects", pgs["degraded_objects"])
+        header("ceph_pg_degraded_ratio", "Ratio of degraded objects to total objects")
+        metric("ceph_pg_degraded_ratio", pgs["degraded_ratio"])
+
+        io = c["client_io"]
+        header("ceph_client_read_bytes_per_second", "Client read throughput in bytes per second")
+        metric("ceph_client_read_bytes_per_second", io["read_bytes_sec"])
+        header("ceph_client_write_bytes_per_second", "Client write throughput in bytes per second")
+        metric("ceph_client_write_bytes_per_second", io["write_bytes_sec"])
+        header("ceph_client_read_ops_per_second", "Client read operations per second")
+        metric("ceph_client_read_ops_per_second", io["read_op_per_sec"])
+        header("ceph_client_write_ops_per_second", "Client write operations per second")
+        metric("ceph_client_write_ops_per_second", io["write_op_per_sec"])
+
+        rec = c["recovery_io"]
+        header("ceph_recovery_bytes_per_second", "Recovery throughput in bytes per second")
+        metric("ceph_recovery_bytes_per_second", rec["recovering_bytes_per_sec"])
+        header("ceph_recovery_keys_per_second", "Recovery keys per second")
+        metric("ceph_recovery_keys_per_second", rec["recovering_keys_per_sec"])
+        header("ceph_recovery_objects_per_second", "Recovery objects per second")
+        metric("ceph_recovery_objects_per_second", rec["recovering_objects_per_sec"])
+
+    bucket_metrics = [b for b in snapshot["watched_buckets"] if "error" not in b]
+    if bucket_metrics:
+        for name, help_text, key in [
+            ("ceph_rgw_bucket_objects_total", "Total number of objects in the bucket", "total_objects"),
+            ("ceph_rgw_bucket_bytes_total", "Total bytes used by the bucket", "total_bytes"),
+            ("ceph_rgw_bucket_shards", "Number of index shards for the bucket", "num_shards"),
+            ("ceph_rgw_bucket_objects_per_shard", "Average objects per index shard", "objects_per_shard"),
+            ("ceph_rgw_bucket_shard_generation", "Current index shard generation", "shard_generation"),
+        ]:
+            header(name, help_text)
+            for b in bucket_metrics:
+                metric(name, b[key], {"bucket": b["bucket"], "tenant": b.get("tenant", "")})
+
+        header("ceph_rgw_bucket_resharding", "1 if bucket is currently being resharded, 0 otherwise")
+        for b in bucket_metrics:
+            val = 0 if b.get("reshard_state") in (None, "none", "None") else 1
+            metric("ceph_rgw_bucket_resharding", val, {"bucket": b["bucket"], "tenant": b.get("tenant", "")})
+
+        header("ceph_rgw_bucket_risk_level", "Reshard risk level: 0=ok 1=warning 2=critical")
+        for b in bucket_metrics:
+            metric("ceph_rgw_bucket_risk_level", RISK_LEVEL_MAP.get(b["risk_level"], -1),
+                   {"bucket": b["bucket"], "tenant": b.get("tenant", "")})
+
+    return "\n".join(lines) + "\n"
+
+
 def print_summary(snapshot):
     q = snapshot["reshard_queue"]
     c = snapshot["cluster_health"]
@@ -242,6 +341,10 @@ if __name__ == "__main__":
     parser.add_argument("buckets", nargs="*", metavar="BUCKET", help="Buckets to watch (tenant/name or name)")
     parser.add_argument("--output", default="snapshot", metavar="PREFIX", help="Output file prefix (default: snapshot)")
     parser.add_argument("--interval", type=int, metavar="SECONDS", help="Repeat every N seconds; omit for a single run")
+    parser.add_argument("--format", dest="fmt", choices=["human", "prometheus"], default="human",
+                        help="Stdout output format: human-readable (default) or prometheus exposition format")
+    parser.add_argument("--prom-file", metavar="PATH",
+                        help="Write Prometheus exposition format to this file on each run (e.g. for node_exporter textfile collector)")
     args = parser.parse_args()
 
     run = 0
@@ -255,7 +358,18 @@ if __name__ == "__main__":
             json.dump(snapshot, f, indent=2)
         print(f"[INFO] Saved {filename}", file=sys.stderr)
 
-        print_summary(snapshot)
+        if args.fmt == "prometheus":
+            print(format_prometheus(snapshot), end="")
+        else:
+            print_summary(snapshot)
+
+        if args.prom_file:
+            prom_text = format_prometheus(snapshot)
+            tmp = args.prom_file + ".tmp"
+            with open(tmp, "w") as f:
+                f.write(prom_text)
+            os.replace(tmp, args.prom_file)
+            print(f"[INFO] Wrote {args.prom_file}", file=sys.stderr)
 
         if not args.interval:
             break
