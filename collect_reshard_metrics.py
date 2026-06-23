@@ -65,7 +65,9 @@ def collect_bucket_stats(bucket_spec):
 
     total_objects = sum(v.get("num_objects", 0) for v in usage.values()) or usage.get("rgw.main", {}).get("num_objects", 0)
     total_bytes = sum(v.get("size_actual", 0) for v in usage.values())
-    num_shards = current_index.get("num_shards", 1) or 1
+    
+    num_shards = data.get("num_shards") or current_index.get("num_shards", 1) or 1
+
     objects_per_shard = total_objects / num_shards
 
     risk_level = "ok"
@@ -90,7 +92,6 @@ def collect_bucket_stats(bucket_spec):
     if target_index:
         result["target_num_shards"] = target_index.get("num_shards")
     return result
-
 
 def collect_cluster_health():
     status = run_cmd(["ceph", "-s", "--format=json"], timeout=30)
